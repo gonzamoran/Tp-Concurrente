@@ -1,4 +1,3 @@
-use rand::Rng;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -14,10 +13,11 @@ struct Mantenimiento {
     cerrado: bool,      // indica si van a llegar mas robots
     atendidos: Vec<i32>,    // ids en el orden en que el mecanico los atendio .Para tests
     rechazos: usize,    // cuantas veces se rechazó a un robot .Para tests
-    max_bahias: usize,  // maximo de bahiuas ocupadas al mismo tiempo .Para tests
+    max_bahias: usize,  // maximo de bahias ocupadas al mismo tiempo .Para tests
 }
 
 // PARA LOS TESTS
+#[allow(dead_code)] // los campos solo se leen en los tests
 struct Resultado {
     atendidos: Vec<i32>,
     rechazos: usize,
@@ -97,7 +97,8 @@ fn ejecutar(robots: i32, bahias: usize, duracion_reparacion: Duration, llegada: 
         let robot = thread::spawn(move || {
             let (ref lock, ref hay_robot, ref robot_arreglado) = *mant_robot;
 
-            // Cada robot llega en un momento distinto pero siempre igual.
+            // Llegada deterministica: (id * 7) % 10 da 10 instantes posibles,
+            // asi que robots cuyo id difiere en 10 (ej. 1 y 11) llegan juntos.
             thread::sleep(llegada * ((id_robot as u32 * 7) % 10));
 
             // loop para que el robot rechazado vuelva a intentar más tarde.
@@ -105,11 +106,15 @@ fn ejecutar(robots: i32, bahias: usize, duracion_reparacion: Duration, llegada: 
                 let mut mantenimiento = lock.lock().unwrap();
                 println!("Robot {id_robot} llega para ser arreglado");
 
+                // Si el mecanico esta libre, el primero de la cola no ocupa bahia:
+                // pasa directo a reparacion en cuanto el mecanico lo tome.
+                let capacidad = if mantenimiento.mecanico_ocupado { bahias } else { bahias + 1 };
+
                 if !mantenimiento.mecanico_ocupado && mantenimiento.bahias.is_empty() {
                     mantenimiento.bahias.push_back(id_robot);
                     println!("Robot {id_robot} despierta al mecánico");
                     hay_robot.notify_one();
-                } else if mantenimiento.bahias.len() < bahias {
+                } else if mantenimiento.bahias.len() < capacidad {
                     mantenimiento.bahias.push_back(id_robot);
                     println!("Robot {id_robot} entra a una bahia");
                 } else {
@@ -120,8 +125,10 @@ fn ejecutar(robots: i32, bahias: usize, duracion_reparacion: Duration, llegada: 
                     continue; // el robot vuelve a intentar
                 }
 
-                // Esto es para los tests
-                let ocupadas = mantenimiento.bahias.len();
+                // Esto es para los tests. Si el mecanico esta libre, el primero de la
+                // cola esta por ser reparado y no cuenta como bahia ocupada.
+                let en_reparacion = if mantenimiento.mecanico_ocupado { 0 } else { 1 };
+                let ocupadas = mantenimiento.bahias.len() - en_reparacion;
                 if ocupadas > mantenimiento.max_bahias {
                     mantenimiento.max_bahias = ocupadas;
                 }
@@ -144,7 +151,7 @@ fn ejecutar(robots: i32, bahias: usize, duracion_reparacion: Duration, llegada: 
         hilo.join().unwrap();
     }
 
-    // Aavisar al mecanico que no vendran mas robots y despertarlo.
+    // Avisar al mecanico que no vendran mas robots y despertarlo.
     {
         let (ref lock, ref hay_robot, _) = *zona_mantenimiento;
         lock.lock().unwrap().cerrado = true;
@@ -156,13 +163,12 @@ fn ejecutar(robots: i32, bahias: usize, duracion_reparacion: Duration, llegada: 
 
     // Genero el resultado a partir del registro.
     let m = zona_mantenimiento.0.lock().unwrap();
-    let resultado = Resultado {
+    Resultado {
         atendidos: m.atendidos.clone(),
         rechazos: m.rechazos,
         max_bahias: m.max_bahias,
         sin_retirar: m.robots_arreglados.len(),
-    };
-    resultado
+    }
 }
 
 fn main() {
@@ -261,6 +267,20 @@ mod tests {
         .expect("DEADLOCK con pocos robots");
         assert_eq!(r.rechazos, 0);
         assert_eq!(r.atendidos.len(), 3);
+    }
+
+    #[test]
+    fn con_tantos_robots_como_bahias_mas_uno_no_hay_rechazos() {
+        // 1 lo atiende el mecanico + 4 en bahias: nadie deberia ser rechazado.
+        // Se repite porque el caso borde depende del scheduling.
+        for i in 0..50 {
+            let r = con_timeout(Duration::from_secs(10), || {
+                ejecutar(5, 4, ms(20), Duration::ZERO, ms(5))
+            })
+            .expect("DEADLOCK");
+            assert_eq!(r.rechazos, 0, "corrida {i}");
+            assert!(r.max_bahias <= 4, "corrida {i}, máximo: {}", r.max_bahias);
+        }
     }
 
     #[test]

@@ -1,20 +1,49 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use std::{thread, vec};
+use std::thread;
 
 const BUFFER_SIZE: usize = 10;
 const PAQUETES_POR_CAMION: usize = 10;
-                                                                     
-struct CintaTransportadora {
-    paquetes: VecDeque<i32>,    // es una cola
-    cerrada: bool,      // avisa  alos robots que no hay mas paquetes
-    dejados: Vec<i32>,    // IDS productos en el orden en que los camiones los dejaron. Para tests
-    tomados: Vec<i32>,   // IDS productos en el orden en que los robots los tomaron. Para tests
-    max_ocupacion: usize,   // maximo de paqetes que hubo al mismo tiempo en la cinta.
+
+// MODELO DE LA PARTE 1
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EstadoPaquete {
+    Pendiente,  // recien creado por el camion
+    EnTransito, // esta arriba de la cinta
+    Entregado,  // un robot lo tomo y lo guardo
 }
 
-// SE AGREGO SOLO PARA LOS TESTSs
+struct Paquete {
+    id: i32,             // en el Stack
+    descripcion: String, // en el Heap
+    estado: EstadoPaquete,
+}
+
+trait Procesable {
+    fn procesar(&mut self);
+}
+
+impl Procesable for Paquete {
+    // Avanza el paquete al siguiente estado
+    fn procesar(&mut self) {
+        self.estado = match self.estado {
+            EstadoPaquete::Pendiente => EstadoPaquete::EnTransito,
+            EstadoPaquete::EnTransito | EstadoPaquete::Entregado => EstadoPaquete::Entregado,
+        };
+    }
+}
+
+struct CintaTransportadora {
+    paquetes: VecDeque<Paquete>,    // es una cola
+    cerrada: bool,      // avisa a los robots que no hay mas paquetes
+    dejados: Vec<i32>,    // IDS productos en el orden en que los camiones los dejaron. Para tests
+    tomados: Vec<i32>,   // IDS productos en el orden en que los robots los tomaron. Para tests
+    max_ocupacion: usize,   // maximo de paquetes que hubo al mismo tiempo en la cinta.
+}
+
+// SE AGREGO SOLO PARA LOS TESTS
+#[allow(dead_code)] // los campos solo se leen en los tests
 struct Resultado {
     dejados: Vec<i32>,
     tomados: Vec<i32>,
@@ -28,7 +57,7 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
     // Validacion de entrada
     assert!(
         robots > 0 || camiones * paquetes_por_camion == 0,
-        "hay paquetes pero no hay robots -> los camiones termirian bloqueados"
+        "hay paquetes pero no hay robots -> los camiones terminarian bloqueados"
     );
 
     let buffer = Arc::new((
@@ -45,7 +74,7 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
 
 
     // LA PARTE DE LOS CAMIONES
-    let mut handles_camiones = vec![];  // Aqui van los JoinHanlde de los threads.
+    let mut handles_camiones = vec![];  // Aqui van los JoinHandle de los threads.
 
     for camion in 1..=camiones {
         let buffer_productor = Arc::clone(&buffer); // Comparte la cinta con el camion.
@@ -55,14 +84,21 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
 
             for i in 1..=paquetes_por_camion {
                 let id_paquete = ((camion - 1) * paquetes_por_camion + i) as i32;
-                let mut cinta = lock.lock().unwrap();   // intenta obterner el MUTEX
+                // Se crea el paquete ANTES de tomar el lock para no alargar la seccion critica.
+                let mut paquete = Paquete {
+                    id: id_paquete,
+                    descripcion: format!("Mercaderia del camion {camion}"),
+                    estado: EstadoPaquete::Pendiente,
+                };
+                let mut cinta = lock.lock().unwrap();   // intenta obtener el MUTEX
 
                 // revisa si la cinta esta llena y si lo esta, el camion se queda esperando.
                 while cinta.paquetes.len() >= capacidad {
                     cinta = no_lleno.wait(cinta).unwrap();
                 }
 
-                cinta.paquetes.push_back(id_paquete);   // agrega el paquete a la cinta.
+                paquete.procesar(); // Pendiente -> EnTransito
+                cinta.paquetes.push_back(paquete);   // agrega el paquete a la cinta (se mueve, ownership pasa a la cinta).
 
                 // Para el test
                 cinta.dejados.push(id_paquete); // guarde el id en dejados
@@ -71,7 +107,7 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
                     cinta.max_ocupacion = ocupacion;
                 }
 
-                println!("Camion {camion}: dejo paquete {id_paquete}");
+                println!("Camión {camion}: dejó paquete P_{id_paquete}");
 
                 no_vacio.notify_one(); // despierta a algun robot que estuviese esperando.
 
@@ -84,7 +120,7 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
 
 
     // LA PARTE DE LOS ROBOTS
-    let mut handles_robots = vec![];  // Aqui van los JoinHanlde de los threads.
+    let mut handles_robots = vec![];  // Aqui van los JoinHandle de los threads.
 
     for robot in 1..=robots {
         let buffer_consumidor = Arc::clone(&buffer); // Comparte la cinta con el robot.
@@ -99,32 +135,36 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
                     cinta = no_vacio.wait(cinta).unwrap();
                 }
 
-                let id_paquete = match cinta.paquetes.pop_front() {
-                    Some(id) => id,
-                    None => break, // cinta vaicia y cerrada: el robot termina su loop
+                let mut paquete = match cinta.paquetes.pop_front() {
+                    Some(p) => p,
+                    None => break, // cinta vacia y cerrada: el robot termina su loop
                 };
-                cinta.tomados.push(id_paquete);     // se guarda el id del paquete tomado
-                println!("Robot {robot}: tomo paquete: {id_paquete}");
+                cinta.tomados.push(paquete.id);     // se guarda el id del paquete tomado
+                println!("Robot {robot}: tomó paquete P_{} ({})", paquete.id, paquete.descripcion);
 
                 no_lleno.notify_one(); // despierta a algun camion que estuviese esperando.
 
                 drop(cinta); // libera la cinta
+
+                // Guardar el paquete se hace fuera de la seccion critica.
+                paquete.procesar(); // EnTransito -> Entregado
+                debug_assert_eq!(paquete.estado, EstadoPaquete::Entregado);
                 thread::sleep(pausa);
             }
         });
         handles_robots.push(handle_robot);
     }
 
-    // Espera a que el thread de todos los caminiones termine.
+    // Espera a que el thread de todos los camiones termine.
     for hilo in handles_camiones {
         hilo.join().unwrap();
     }
 
     //
     {
-        let (ref lock, ref no_lleno, ref no_vacio) = *buffer;
-        lock.lock().unwrap().cerrada = true;  // ciera la cinta, osea no van a venir mas paquetes
-        no_lleno.notify_all();
+        // Solo se despierta a los robots: los camiones ya terminaron, no hay ninguno esperando en no_lleno.
+        let (ref lock, _, ref no_vacio) = *buffer;
+        lock.lock().unwrap().cerrada = true;  // cierra la cinta, osea no van a venir mas paquetes
         no_vacio.notify_all(); // Despierta a todos los robots que estaban esperando
     }
 
@@ -135,12 +175,11 @@ fn ejecutar(camiones: usize, paquetes_por_camion: usize, robots: usize, capacida
 
     // Construyo el resultado a partir del registro de la cinta.
     let cinta = buffer.0.lock().unwrap();
-    let resultado = Resultado {
+    Resultado {
         dejados: cinta.dejados.clone(),
         tomados: cinta.tomados.clone(),
         max_ocupacion: cinta.max_ocupacion,
-    };
-    resultado
+    }
 }
 
 fn main() {
