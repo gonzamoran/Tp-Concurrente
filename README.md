@@ -6,7 +6,7 @@ Programación Concurrente - FIUBA.
 
 | Ruta | Contenido |
 |------|-----------|
-| `src/actores.rs` | Parte 1: actores y enums de mensajes |
+| `src/actores/` | Parte 1: actores `CuentaUsuario` e `InventarioEntradas` y sus enums de mensajes |
 | `src/heartbeat.rs` | Parte 2: heartbeats, Monitor, detección de fallos |
 | `src/two_phase_commit.rs` | Parte 3: coordinador 2PC |
 | `src/bin/` | Un ejecutable por parte |
