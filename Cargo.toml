@@ -1,0 +1,10 @@
+[package]
+name = "tp2"
+version = "0.1.0"
+edition = "2024"
+description = "TP2 Programación Concurrente (FIUBA) - Motor Distribuido de Reservas y Pagos"
+
+# Un binario por parte del enunciado (src/bin/*.rs).
+# Ejecutar con: cargo run --bin <nombre>
+
+[dependencies]
