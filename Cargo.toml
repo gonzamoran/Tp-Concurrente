@@ -8,3 +8,4 @@ description = "TP2 Programación Concurrente (FIUBA) - Motor Distribuido de Rese
 # Ejecutar con: cargo run --bin <nombre>
 
 [dependencies]
+rand = "0.10.4"

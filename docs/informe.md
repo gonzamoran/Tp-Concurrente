@@ -285,7 +285,65 @@ mensajes serían exactamente los mismos que diseñamos.
 
 ## Parte 2: Coordinación y Tolerancia a Fallos
 ### 2.1 Detección de fallos (diseño del simulador)
+Para modelar el cluster de 3 nodos coordinadores se diseño una arquitectura usando hilos y pasaje de mensajes por canales MPSC.
+- Componentes:
+   - Nodos(`Nodo`): Se instancian 3 nodos con ids unicos, donde el nodo es el nodo de mayor ID. Cada nodo tiene su propio hilo y envia un mensaje (`MensajeMonitor::Heartbeat(id)`) cada 500ms hacia el Monitor.
+   - Monitor (`Monitor`): Detecta fallos. Mantiene un Hash en el que registra el tiempo del ultimo ladito recibido y estado actual de cada nodo.
+- Deteccion basada en timeouts:
+   - El monitor escucha en su canal de entrada mediante rec_timeout(100ms). Al recivir un latido, actualiza el Instant del nodo correspondiente, y si se encontraba en estado Sospechoso lo vuelve a poner como Activo.
+   - En cada iteracion ejecuta `verificar_timeouts()`, evaluando el tiempo transcurrido desde el ultimo latido de cada nodo.
+| Tiempo sin rta | Estado | Accion del Monitor |
+| --- | --- | --- |
+| < 1s | `ACTIVO` | operacion normal | 
+| >= 1s y < 2s | `SOSPECHOSO` | Registra que esta demorando (Lo puede reveritr a ACTIVO si le llega un latido antes de los 2 seg)|
+| >= 2s | `CAIDO` | Si es un nodo comun, el lider actual se mantiene. Si es el lider, dispara la eleccion | 
+
+- Simulacion de caida aleatoria: Desde main, un hilo auxiliar espera 3 segundos, elige un nodo al azar y le envia `MensajeNodo::Kill`, haciendo que ese nodo salga de su bucle y deje de enviar heartbeats.
+
 ### 2.2 Algoritmo Bully para elegir el nuevo líder
+
+El Algoritmo Bully asume que todos los procesos tienen un id unico, que cada nodo conoce a sus pares y que el coordinador siempmre debe ser el nodo activo con el ID mas alto.
+
+Escenario en el cluster de 3 nodos. (Lider inicial Nodo 3)
+- Caso A - Cae un nodo no lider (Nodo 1 o Nodo 2)
+El monitor detecta el fallo tras 2 segundos sin latidos y marca al nodo como CAIDO. Como lider sigue enviando hearbeats, el cluster continua operando sin necesidad de iniciar una eleccion. (En el codigo, se hizo para demostracion, que una vez que cae un nodo, que el programa corte. Si es necesaria una eleccion, se elige y luego corta).
+- Caso B - Cae el nodo lider (Nodo 3):
+1. Despues de 2 segundos sin recibir heartbeats del Nodo 3, el Monitor lo declara como `CAIDO` y notifica a los nodos sobrevivientes (1 y 2), mediante `IniciarEleccion`.
+2. Envio de `ELECTION`: Cada nodo inicia la eleccion envia el mensaje `ELECTION` a todos lo snodos con ID mayor al suyo y activa un temporizador. 
+   - El Nodo 1 envia ELECTION a los nodos `2` y `3`.
+   - El Nodo 2 envia ELECTION solo al nodo `3`.
+3. Respuesta `OK`: Al recibir `ELECTION(1)`, el Nodo 2 (activo y que tiene mayor prioridad), responde `OK(2)` al Nodo 1 y continua con su propia posutlaicon. Al recibir el `OK` el Nodo 1 corta su candidatura y espera a que se le anuncie el ganador bajo un timeout (`espera_coord`).
+4. Proclamacion(`COORDINATOR`): Como el Nodo 3 esta caido, nunca responde `OK` al Nodo 2. Al vencer el temporizador `espera_ok` (300ms) sin respuestas, el Nodo 2 concluye que es el nodo vivo de mayor jerarquia, se autoproclama nuevo coordinador, envia `COORDINATOR(2)` a sus pares y notifica `NuevoLider(2)` al Monitor.  
+5. Tolerancia a fallos: Si el Nodo 2 tambien cayera luego de haber enviado `OK`, se venceria el temporizador `espera_coord` en el Nodo 1, el cual reinciaria la elección y, al no oobtener respuesta de nodos mayores, se proclamaria lider.
+
+### 2.3 Plan de pruebas parte 2.
+
+- **Pruebas unitarias ** (`src/heartbeat.rs`): Evalúan la lógica interna de `Monitor` y `Nodo` con marcas de tiempo pasadas (`Instant::now() - Duration`) y leyendo mensajes directamente desde los canales `mpsc` con `try_recv()`, sin hilos ni `thread::sleep`.
+- **Pruebas End-2-End** (`tests/parte2_heartbeats.rs`): Levantan el clúster real de 3 nodos concurrentes más el Monitor con fallos inducidos (`MensajeNodo::Kill`), validando tiempos reales, intercambio de mensajes Bully y cierre limpio de hilos (`join`).
+
+
+## 1. Pruebas Unitarias (`src/heartbeat.rs`)
+
+| Caso de prueba | Escenario / Entrada | Resultado esperado | Aspecto validado |
+|---|---|---|---|
+| `nodo_pasa_a_sospechoso_despues_1s` | Último latido del nodo 1 hace 1200 ms. Se invoca `verificar_timeouts()`. | Devuelve `false`. El estado del nodo 1 pasa a `Sospechoso`. | Detección de demora ($\ge 1\text{ s}$ y $< 2\text{ s}$) sin corte prematuro del monitor. |
+| `nodo_pasa_a_caido_despues_2s` | Último latido del nodo 1 hace 2100 ms. Se invoca `verificar_timeouts()`. | Devuelve `true`. El estado del nodo 1 pasa a `Caido`. | Detección de fallo confirmado ($\ge 2\text{ s}$). |
+| `nodo_caido_no_es_lider_y_lider_se_mantiene` | Clúster `[1, 2, 3]` con líder 3. Nodo 1 sin latido hace 2100 ms. | `verificar_timeouts()` devuelve `true`, nodo 1 queda `Caido` y `monitor.lider` permanece en 3. | Estabilidad del liderazgo ante caída de un nodo común. |
+| `caida_del_lider_empieza_eleccion` | Clúster `[1, 2, 3]` con líder 3. Nodo 3 sin latido hace 2100 ms. | `verificar_timeouts()` devuelve `false`, nodo 3 pasa a `Caido`. Los canales de 1 y 2 reciben `IniciarEleccion`; el de 3 no recibe nada. | Disparo selectivo de Bully solo hacia nodos vivos al caer el líder. |
+| `bully_responde_ok_y_se_postula` | Nodo 2 (pares `[1, 3]`) procesa `MensajeNodo::Election(1)`. | Envía `Ok(2)` al nodo 1, envía `Election(2)` al nodo 3 y activa `espera_ok`. | Respuesta de prioridad y propagación ascendente de Bully. |
+| `bully_nodo_mayor_coordinador` | Nodo 3 (pares `[1, 2]`) procesa `IniciarEleccion`. | Actualiza `lider = 3`, envía `Coordinator(3)` a 1 y 2, y envía `NuevoLider(3)` al Monitor. | Proclamación inmediata cuando no existen pares con ID mayor. |
+| `bully_sin_rta_ok_gana_por_timeout` | Nodo 2 inicia elección hacia 3; se simula el vencimiento de `espera_ok` y se invoca `revisar_timeouts()`. | Actualiza `lider = 2` y envía `NuevoLider(2)` al Monitor. | Victoria por timeout cuando los nodos superiores están caídos. |
+
+## 2. Pruebas de Integración / E2E (`tests/parte2_heartbeats.rs`)
+
+Todos los casos instancian 3 nodos en hilos separados con líder inicial 3, inducen fallos mediante `Kill` y verifican el `join()` sin deadlocks ni panics.
+
+| Caso de prueba | Estímulo / Fallo inducido | Resultado esperado | Aspecto validado |
+|---|---|---|---|
+| `e2e_caida_lider_elige_nuevo_coordinador` | Se envía `Kill` al nodo 3 (líder) a los 500 ms. | El Monitor detecta la caída tras 2 s, dispara Bully y finaliza con `monitor.lider == 2`, nodo 3 en `Caido`, nodos 1 y 2 en `Activo`. | Flujo completo de detección + elección `ELECTION → OK → COORDINATOR` en concurrencia real. |
+| `e2e_caida_nodo_comun_mantiene_lider` | Se envía `Kill` al nodo 1 a los 500 ms. | El Monitor marca al nodo 1 como `Caido`, corta el monitoreo y mantiene `monitor.lider == 3`, con nodos 2 y 3 en `Activo`. | Continuidad del líder sin elecciones innecesarias ante fallos no críticos. |
+| `e2e_caidas_nodos_2_y_3` | Se envía `Kill` al nodo 3 y al nodo 2 de forma consecutiva. | El nodo 1 inicia elección, vence `espera_ok` sin respuestas y resulta elegido (`monitor.lider == 1`), con nodo 1 en `Activo`, nodo 3 en `Caido` y nodo 2 fuera de `Activo`. | Fallo múltiple simultáneo y promoción del único sobreviviente. |
+
 
 ## Parte 3: Transacciones Distribuidas
 ### 3.1 Coordinador 2PC (Prepare y Commit/Rollback)
