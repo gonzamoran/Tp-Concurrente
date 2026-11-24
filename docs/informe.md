@@ -716,11 +716,118 @@ Control and Recovery in Database Systems*, cap. 7).
 | Liveness | se pierde: los participantes quedan bloqueados en PREPARED | se recupera: el coordinador reenvía la decisión |
 | Recursos | asiento `Reservado` y dinero retenido, nadie los puede usar | asiento vendido y dinero cobrado |
 
+
+
 ## Parte 4: Modelado Formal con Redes de Petri
-### 4.1 Red de Petri Coordinador + 1 Participante
-Lugares obligatorios: `Coordinador_Esperando_Votos`, `Participante_Prepared`, `Estado_Commit`.
+
+### 4.1 Red de Petri: Coordinador + 1 Participante
+
+Modelamos el protocolo Two-Phase Commit (2PC) simplificado entre el `Coordinador` y un `Participante` genérico, que en nuestra arquitectura representa indistintamente a `ServicioPagos` (sobre `CuentaUsuario`) o a `ServicioInventario` (sobre `InventarioEntradas`). La red captura el flujo completo de una transacción exitosa (Fase 1 de preparación y Fase 2 de commit) e incorpora la rama alternativa de aborto en Fase 1 para validar formalmente la exclusión mutua entre Commit y Rollback en 4.2.
+
+**Lugares ($P$) y correspondencia con el código**
+
+Los 12 lugares se organizan en estados del coordinador, estados del participante y canales de mensajes intermedios que modelan la comunicación asincrónica. 
+
+| Lugar | Rol | Correspondencia en el código | $M_0$ |
+|---|---|---|---|
+| $P_1$: `Coord_Inicial` | Coordinador | Estado previo a `Coordinador::ejecutar`; la `tx` todavía no figura en `log`. | 1 |
+| $P_2$: `Coordinador_Esperando_Votos` | Coordinador | Se anota `EntradaLog::EsperandoVotos(tx)` tras enviar `prepare`. | 0 |
+| $P_3$: `Coord_Commit` | Coordinador | El coordinador recibe `Voto::Yes` y registra `EntradaLog::Decision(tx, Decision::Commit)`. | 0 |
+| $P_4$: `Coord_Rollback` | Coordinador | El coordinador recibe `Voto::No` y registra `EntradaLog::Decision(tx, Decision::Rollback)`. | 0 |
+| $P_5$: `Part_Inicial` | Participante | Recurso libre antes del `prepare`: `EstadoAsiento::Libre` o monto en `saldo_disponible`. | 1 |
+| $P_6$: `Participante_Prepared` | Participante | Recurso retenido tras votar `Voto::Yes`: `EstadoAsiento::Reservado(tx)` o monto en `retenciones`. | 0 |
+| $P_7$: `Estado_Commit` | Participante | `Desenlace::Confirmada`: `EstadoAsiento::Vendido(tx)` o monto sumado a `debitado`. | 0 |
+| $P_8$: `Estado_Rollback` | Participante | `Desenlace::Cancelada`: operación rechazada o deshecha; asiento en `Libre` y saldo sin cobrar. | 0 |
+| $P_9$: `Msg_Prepare` | Mensaje | Invocación `participante.prepare(compra)` (`SolicitarReserva` / `SolicitarDebito`). | 0 |
+| $P_{10}$: `Msg_Vote_Yes` | Mensaje | Respuesta `Voto::Yes` enviada al coordinador. | 0 |
+| $P_{11}$: `Msg_Vote_No` | Mensaje | Respuesta `Voto::No(motivo)` enviada al coordinador. | 0 |
+| $P_{12}$: `Msg_Commit` | Mensaje | Orden `participante.commit(tx)` (`ConfirmarReserva` / `ConfirmarDebito`). | 0 |
+
+*(Nota: en el código real, `Coordinador::fase2` aguarda además la confirmación `Ok` del participante para registrar `EntradaLog::Fin(tx)`. En este modelo simplificado se omite el `ACK` final para mantener la red focalizada en la causalidad de las fases Prepare y Commit/Rollback).*
+
+**Transiciones ($T$) y arcos ($F$)**
+
+Todos los arcos de la red tienen peso unitario ($W = 1$), por lo que cada arco consume o deposita exactamente un token al dispararse una transición.
+
+| Transición | Entradas ($P \to T$) | Salidas ($T \to P$) | Evento en el protocolo / código |
+|---|---|---|---|
+| $T_1$: `Enviar_Prepare` | `Coord_Inicial` | `Coordinador_Esperando_Votos`, `Msg_Prepare` | Fase 1: el coordinador registra `EsperandoVotos(tx)` y envía `prepare`. |
+| $T_2$: `Votar_Yes` | `Part_Inicial`, `Msg_Prepare` | `Participante_Prepared`, `Msg_Vote_Yes` | El participante reserva el asiento o retiene el saldo y responde `Voto::Yes`. |
+| $T_3$: `Votar_No` | `Part_Inicial`, `Msg_Prepare` | `Estado_Rollback`, `Msg_Vote_No` | Falla la validación local (sin stock o sin saldo); aborta localmente y responde `Voto::No`. |
+| $T_4$: `Decidir_Commit` | `Coordinador_Esperando_Votos`, `Msg_Vote_Yes` | `Coord_Commit`, `Msg_Commit` | Fase 2: con voto positivo, el coordinador registra `Decision(tx, Commit)` y envía `commit`. |
+| $T_5$: `Ejecutar_Commit` | `Participante_Prepared`, `Msg_Commit` | `Estado_Commit` | El participante aplica el commit definitivo (`Vendido(tx)` / `debitado`). |
+| $T_6$: `Decidir_Rollback` | `Coordinador_Esperando_Votos`, `Msg_Vote_No` | `Coord_Rollback` | Fase 2: ante `Voto::No`, el coordinador registra `Decision(tx, Rollback)` y cierra abortada. |
+
+![Red de Petri en marcado inicial M0](./img/petri_inicial.png)
+
+*Figura 1: Red de Petri en su marcado inicial $M_0$ (`Coord_Inicial = 1`, `Part_Inicial = 1`, resto en `0`). La única transición habilitada (en verde) es `Enviar_Prepare`*.
+
+**Evolución del marcado en una transacción exitosa**
+
+Por la regla de habilitación ($M(p) \ge W(p, t)$) y disparo atómico ($M'(p) = M(p) - W(p, t) + W(t, p)$), al dispararse $T_1$ las transiciones $T_2$ (`Votar_Yes`) y $T_3$ (`Votar_No`) entran en **conflicto** (compiten por los mismos tokens en `Part_Inicial` y `Msg_Prepare`), modelando el no-determinismo de la votación en Fase 1. Siguiendo el camino exitoso ($T_1 \to T_2 \to T_4 \to T_5$), el marcado evoluciona así:
+
+| Paso | Transición disparada | Lugares con token ($M(p) = 1$) |
+|---|---|---|
+| $M_0$ | — | `Coord_Inicial`, `Part_Inicial` |
+| $M_1$ | $T_1$: `Enviar_Prepare` | `Coordinador_Esperando_Votos`, `Part_Inicial`, `Msg_Prepare` |
+| $M_2$ | $T_2$: `Votar_Yes` | `Coordinador_Esperando_Votos`, `Participante_Prepared`, `Msg_Vote_Yes` |
+| $M_3$ | $T_4$: `Decidir_Commit` | `Coord_Commit`, `Participante_Prepared`, `Msg_Commit` |
+| $M_4$ | $T_5$: `Ejecutar_Commit` | `Coord_Commit`, `Estado_Commit` |
+
+
+![Red de Petri en estado final Commit](./img/petri_commit.png)
+
+*Figura 2: Marcado final $M_4$ de una transacción exitosa tras disparar $T_1 \to T_2 \to T_4 \to T_5$. Los tokens finalizan en `Coord_Commit` y `Estado_Commit`, con todos los canales en `0` y sin transiciones habilitadas.*
+
+De forma análoga, si el conflicto en $M_1$ se resuelve mediante $T_3$ (`Votar_No`) seguido de $T_6$ (`Decidir_Rollback`), la red termina limpiamente con tokens únicamente en `Coord_Rollback` y `Estado_Rollback`.
+
+![Red de Petri en estado final Rollback](./img/petri_rollback.png)
+
+*Figura 3: Marcado final alternativo tras disparar $T_1 \to T_3 \to T_6$. Tanto el Coordinador (`Coord_Rollback`) como el Participante (`Estado_Rollback`) concluyen en aborto consistente.*
+
 ### 4.2 Invariante de lugar (Commit y Rollback nunca a la vez)
+
+Un **invariante de lugar** establece una suma ponderada de tokens que se mantiene constante en todo marcado alcanzable $M \in R(M_0)$. Sobre los cuatro lugares que representan el ciclo de vida del Participante se cumple:
+
+$$
+M(\text{Part\_Inicial}) + M(\text{Participante\_Prepared}) + M(\text{Estado\_Commit}) + M(\text{Estado\_Rollback}) = 1
+$$
+
+**Demostración:**
+
+1. **Base ($M_0$):** En el marcado inicial, `Part_Inicial` tiene $1$ token y los otros tres lugares valen $0$: $1 + 0 + 0 + 0 = 1$.
+2. **Conservación en cada transición ($\Delta = 0$):**
+   - $T_2$ (`Votar_Yes`): consume $1$ de `Part_Inicial` y produce $1$ en `Participante_Prepared` ($\Delta = -1 + 1 = 0$).
+   - $T_3$ (`Votar_No`): consume $1$ de `Part_Inicial` y produce $1$ en `Estado_Rollback` ($\Delta = -1 + 1 = 0$).
+   - $T_5$ (`Ejecutar_Commit`): consume $1$ de `Participante_Prepared` y produce $1$ en `Estado_Commit` ($\Delta = -1 + 1 = 0$).
+   - $T_1, T_4, T_6$: no inciden sobre los lugares del Participante ($\Delta = 0$).
+
+Como todo marcado cumple $M(p) \in \mathbb{N}_0$, si el Participante alcanza `Estado_Commit` ($M(\text{Estado\_Commit}) = 1$), necesariamente $M(\text{Estado\_Rollback}) = 0$ (Figura 2); y recíprocamente, si alcanza `Estado_Rollback` ($M(\text{Estado\_Rollback}) = 1$), necesariamente $M(\text{Estado\_Commit}) = 0$ (Figura 3). Queda entonces probado que el Participante nunca puede estar en Commit y Rollback simultáneamente.
+
+De manera simétrica, el Coordinador cumple su propio invariante de lugar:
+
+$$
+M(\text{Coord\_Inicial}) + M(\text{Coordinador\_Esperando\_Votos}) + M(\text{Coord\_Commit}) + M(\text{Coord\_Rollback}) = 1
+$$
+
+En el código en Rust (`src/actores/mod.rs`, `cuenta_usuario.rs` e `inventario_entradas.rs`), este invariante se garantiza mediante el registro `finalizadas: HashMap<IdTransaccion, Desenlace>` con `enum Desenlace { Confirmada, Cancelada }`: una vez confirmada una `tx`, cualquier rollback retorna `TransaccionYaConfirmada`, y una vez cancelada, cualquier commit retorna `TransaccionYaCancelada`.
+
 ### 4.3 Boundedness: qué significa que la red sea 1-acotada (safe)
+
+Una Red de Petri es **$K$-acotada** si $M(p) \le K$ para todo lugar $p \in P$ y todo marcado alcanzable $M \in R(M_0)$. Cuando $K = 1$ ($M(p) \in \{0, 1\}$), la red es **1-Acotada** o **Segura (*Safe*)**.
+
+**Verificación en nuestra red:**
+
+- Los lugares del Participante y del Coordinador están acotados por $1$ debido a los dos invariantes de lugar demostrados en 4.2 (sus sumas valen siempre $1$).
+- Los canales de mensajes (`Msg_Prepare`, `Msg_Vote_Yes`, `Msg_Vote_No`, `Msg_Commit`) también cumplen $M(p) \le 1$: al no existir ciclos de retorno hacia `Coord_Inicial`, $T_1$ se dispara a lo sumo una vez, y el conflicto en $M_1$ habilita únicamente una de las dos ramas de votación ($T_2$ o $T_3$).
+
+**Significado en el contexto del TP2:**
+
+Ser 1-acotada equivale a la propiedad de **Safety** (*"algo malo nunca ocurre"*) y a la exclusión mutua estricta. En el Motor Distribuido de Reservas y Pagos esto implica:
+
+- **Cero doble venta de entradas:** Cada lugar actúa como una condición binaria ($0$ o $1$), garantizando que un asiento en `InventarioEntradas` transita una única vez de `Libre` a `Reservado(tx)` y luego a `Vendido(tx)`.
+- **Cobros exactos (sin doble débito):** En `CuentaUsuario`, el monto retenido en fase 1 (`retenciones`) pasa exactamente una vez a `debitado`, evitando cobrar dos veces por la misma compra.
+- **Prevención de desbordamientos en colas:** Que los lugares de mensajes estén acotados a $K = 1$ impide la acumulación descontrolada de mensajes duplicados por transacción en los buzones. En la implementación, esto se refuerza rechazando transacciones repetidas en `Coordinador::ejecutar` (`ErrorCoordinador::TransaccionRepetida`) y haciendo idempotentes los handlers de cada actor mediante `IdTransaccion`.
 
 ## Plan de Pruebas
 
@@ -817,3 +924,21 @@ otro coordinador y la recuperación al volver la red. Para cada una muestra el l
 el resultado, y verifica con `assert!` el estado del asiento y de la cuenta.
 
 ## Cómo la Red de Petri captura los escenarios de fallo del código
+
+La topología de la red refleja directamente los escenarios de fallo simulados y testeados en `src/two_phase_commit.rs`, `tests/parte3_2pc.rs` y `src/heartbeat.rs`:
+
+1. **Partición de red tras el voto `Yes` (`Enlace::cortar_tras_prepare()` — Bloqueo y pérdida de Liveness):**
+   - *En el código:* Tras recibir `Voto::Yes` de los servicios, el coordinador escribe `EntradaLog::Decision(tx, Decision::Commit)`, pero el corte en `Enlace` impide entregar `commit(tx)` tras los `INTENTOS_FASE2` reintentos, devolviendo `ResultadoTransaccion::Incompleta`. Los actores mantienen el asiento en `EstadoAsiento::Reservado(tx)` y el monto en `retenciones`, rechazando compras rivales (como `tx#6` en la demo).
+   - *En la Red de Petri:* Tras dispararse $T_1$ y $T_2$, el token del Participante queda alojado en **`Participante_Prepared`** ($P_6$). Al perderse la comunicación antes de que llegue `Msg_Commit` ($P_{12}$), la única transición saliente del Participante ($T_5$: `Ejecutar_Commit`) carece de uno de sus dos tokens de entrada y no puede habilitarse. Como no existe ninguna transición de aborto unilateral saliendo de `Participante_Prepared`, el token queda **atascado**, demostrando geométricamente el bloqueo indefinido (pérdida de **Liveness**) que 2PC acepta para preservar **Safety**.
+   - *Recuperación:* Cuando se invoca `Enlace::restablecer()` y `Coordinador::reenviar_decision()`, la entrega de la decisión desde el log equivale a depositar el token en `Msg_Commit` ($P_{12}$), habilitando inmediatamente $T_5$ para desbloquear al Participante y llevar el token a `Estado_Commit` ($P_7$).
+
+2. **Fallo local o partición antes del voto (`Voto::No`, `ActorDetenido` o `Enlace::cortar()` — Aborto sin bloqueo):**
+   - *En el código:* Si falta saldo (`SaldoInsuficiente`), el asiento está ocupado (`AsientoNoDisponible`), el actor está detenido (`ActorDetenido`) o el enlace está cortado antes del `Prepare` (`particion_antes_del_voto_no_bloquea_recursos`), `prepare` devuelve `Voto::No` y el coordinador decide `Decision::Rollback` sin dejar recursos bloqueados.
+   - *En la Red de Petri:* El conflicto en $M_1$ se resuelve disparando $T_3$ (`Votar_No`) en lugar de $T_2$. El token pasa directamente de `Part_Inicial` ($P_5$) a `Estado_Rollback` ($P_8$) sin entrar nunca en la ventana de incertidumbre (`Participante_Prepared`), y `Msg_Vote_No` ($P_{11}$) habilita $T_6$ (`Decidir_Rollback`) para finalizar en `Coord_Rollback` ($P_4$) (Figura 3). Esto modela por qué los fallos previos al voto `Yes` no producen bloqueo.
+
+3. **Rechazo de transiciones inválidas y re-ejecución (`TransaccionYaConfirmada`, `TransaccionYaCancelada`, `TransaccionRepetida`):**
+   - *En el código:* Los actores rechazan confirmar una transacción cancelada o liberar una vendida, y el coordinador bloquea re-ejecutar una `tx` ya presente en `log`.
+   - *En la Red de Petri:* Tanto `Estado_Commit` ($P_7$) como `Estado_Rollback` ($P_8$) son lugares absorbentes (sin arcos de salida) y `Coord_Inicial` ($P_1$) nunca se recarga, lo que hace topológicamente imposible revertir una decisión o reabrir la misma transacción.
+
+4. **Conexión con la detección de fallos y elección de líder (Parte 2):**
+   - Si el nodo líder que actúa como coordinador cae abruptamente mientras el Participante está bloqueado en `Participante_Prepared` ($P_6$), el `Monitor` de la Parte 2 (`src/heartbeat.rs`) detecta la falta de latidos mediante `recv_timeout` (pasando por `Sospechoso` al segundo y `Caido` a los 2 segundos) y dispara el Algoritmo de Bully (`ELECTION` $\to$ `OK` $\to$ `COORDINATOR`) para promover un nuevo líder. Al contar con el log de decisiones replicado, el nuevo coordinador puede reinyectar la orden en `Msg_Commit` ($P_{12}$) y destrabar el token atascado del Participante.
