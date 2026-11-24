@@ -790,7 +790,7 @@ De forma análoga, si el conflicto en $M_1$ se resuelve mediante $T_3$ (`Votar_N
 Un **invariante de lugar** establece una suma ponderada de tokens que se mantiene constante en todo marcado alcanzable $M \in R(M_0)$. Sobre los cuatro lugares que representan el ciclo de vida del Participante se cumple:
 
 $$
-M(\text{Part\_Inicial}) + M(\text{Participante\_Prepared}) + M(\text{Estado\_Commit}) + M(\text{Estado\_Rollback}) = 1
+M(\text{Part Inicial}) + M(\text{Participante Prepared}) + M(\text{Estado Commit}) + M(\text{Estado Rollback}) = 1
 $$
 
 **Demostración:**
@@ -802,12 +802,12 @@ $$
    - $T_5$ (`Ejecutar_Commit`): consume $1$ de `Participante_Prepared` y produce $1$ en `Estado_Commit` ($\Delta = -1 + 1 = 0$).
    - $T_1, T_4, T_6$: no inciden sobre los lugares del Participante ($\Delta = 0$).
 
-Como todo marcado cumple $M(p) \in \mathbb{N}_0$, si el Participante alcanza `Estado_Commit` ($M(\text{Estado\_Commit}) = 1$), necesariamente $M(\text{Estado\_Rollback}) = 0$ (Figura 2); y recíprocamente, si alcanza `Estado_Rollback` ($M(\text{Estado\_Rollback}) = 1$), necesariamente $M(\text{Estado\_Commit}) = 0$ (Figura 3). Queda entonces probado que el Participante nunca puede estar en Commit y Rollback simultáneamente.
+Como todo marcado cumple $M(p) \in \mathbb{N}_0$, si el Participante alcanza `Estado_Commit` ($M(\text{Estado Commit}) = 1$), necesariamente $M(\text{Estado Rollback}) = 0$ (Figura 2); y recíprocamente, si alcanza `Estado_Rollback` ($M(\text{Estado Rollback}) = 1$), necesariamente $M(\text{Estado Commit}) = 0$ (Figura 3). Queda entonces probado que el Participante nunca puede estar en Commit y Rollback simultáneamente.
 
 De manera simétrica, el Coordinador cumple su propio invariante de lugar:
 
 $$
-M(\text{Coord\_Inicial}) + M(\text{Coordinador\_Esperando\_Votos}) + M(\text{Coord\_Commit}) + M(\text{Coord\_Rollback}) = 1
+M(\text{Coord Inicial}) + M(\text{Coordinador Esperando Votos}) + M(\text{Coord Commit}) + M(\text{Coord Rollback}) = 1
 $$
 
 En el código en Rust (`src/actores/mod.rs`, `cuenta_usuario.rs` e `inventario_entradas.rs`), este invariante se garantiza mediante el registro `finalizadas: HashMap<IdTransaccion, Desenlace>` con `enum Desenlace { Confirmada, Cancelada }`: una vez confirmada una `tx`, cualquier rollback retorna `TransaccionYaConfirmada`, y una vez cancelada, cualquier commit retorna `TransaccionYaCancelada`.
