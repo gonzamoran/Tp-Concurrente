@@ -18,17 +18,17 @@ fn levantar_cluster() -> (
     let ids = vec![1, 2, 3];
 
     let mut senders = HashMap::new();
-    let mut recievers = Vec::new();
+    let mut receivers = Vec::new();
 
     let mut hilos = vec![];
 
     for &i in &ids {
         let (caida_tx, caida_rx) = mpsc::channel::<MensajeNodo>();
         senders.insert(i, caida_tx);
-        recievers.push((i, caida_rx));
+        receivers.push((i, caida_rx));
     }
 
-    for (i, r) in recievers {
+    for (i, r) in receivers {
         let otros: HashMap<_, _> = senders
             .iter()
             .filter(|(id, _)| **id != i)

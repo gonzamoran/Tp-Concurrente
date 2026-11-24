@@ -1,13 +1,15 @@
-// Parte 2 - Coordinación y Tolerancia a Fallos.
-
-/*
-Algoritmo Bully
-
-P envia el mensaje ELECTION a todos los nodos que tengan un numero mayor.
-Si nadie responde, P gana la eleccion y es el nuevo coordinador.
-Si contesta OK algun nodo con numero mayor, ese sigue con el proceso y P espera al resultado
-El nuevo coordinador se anuncia con un mensaje COORDINATOR
-*/
+//! Parte 2 - Coordinación y Tolerancia a Fallos.
+//!
+//! Detección de fallos: cada `Nodo` manda un `Heartbeat` cada 500 ms al
+//! `Monitor` por un canal `mpsc` compartido. El Monitor usa `recv_timeout`
+//! y declara a un nodo SOSPECHOSO si pasa 1 s sin latidos y CAIDO a los 2 s.
+//!
+//! Algoritmo Bully (cuando cae el líder):
+//! - Un nodo P envía ELECTION a todos los nodos con id mayor.
+//! - Si nadie responde, P gana la elección y es el nuevo coordinador.
+//! - Si algún nodo mayor contesta OK, ese sigue con la elección y P espera
+//!   el resultado.
+//! - El nuevo coordinador se anuncia con un mensaje COORDINATOR.
 use std::fmt::Display;
 use std::{
     collections::HashMap,
@@ -27,7 +29,8 @@ pub enum EstadoNodo {
 /// Mensajes que se mandan entre nodos durante el algoritmo Bully o control.
 #[derive(Debug, PartialEq)]
 pub enum MensajeNodo {
-    /// Señal que manda el monitor para terminar el hilo del nodo.
+    /// Termina el hilo del nodo. Lo usa la simulación para provocar una caída
+    /// y el Monitor para apagar el clúster al terminar.
     Kill,
     /// Notificacion del monitor indicando que tiene que empezar una eleccion
     IniciarEleccion,
@@ -36,7 +39,7 @@ pub enum MensajeNodo {
     Coordinator(u64),
 }
 
-/// Mnesajes de los nodos hacia el Monitor
+/// Mensajes de los nodos hacia el Monitor.
 #[derive(Debug, PartialEq)]
 pub enum MensajeMonitor {
     Heartbeat(u64),
@@ -97,10 +100,13 @@ impl Nodo {
         }
     }
 
-    /// Inicia el loop de los Nodos: envian un Heartbeat cada 500ms y escuchan mensajes.
-    /// Se usa el recv_timeout aca para que si se cumplen los 500ms (es decir, se cumple el Timeout) se simula el nodo durmiendo y si escucha algo es porque el nodo se cayo.
-    /// El nodo se puede caer de manera aleatoria. Si no se cae su flujo es mandar un heartbeat y dormir 500ms.
-    /// tiene un rec_timeout de 50 ms para manejar los eventos de Bully y revisar los timeouts. Termina al recibir Kill o si se desconecta el canal.
+    /// Loop del nodo: manda un `Heartbeat` al Monitor cada 500 ms y, mientras
+    /// tanto, atiende los mensajes del algoritmo Bully.
+    ///
+    /// Escucha su canal con `recv_timeout` de 50 ms para no quedarse bloqueado:
+    /// así puede mandar el próximo latido a tiempo y revisar los timeouts de la
+    /// elección aunque no le lleguen mensajes. Termina al recibir `Kill` (que
+    /// simula su caída) o si se desconecta el canal.
     pub fn iniciar(mut self) {
         let mut proximo_heartbeat = Instant::now();
         loop {
@@ -155,7 +161,8 @@ impl Nodo {
         }
     }
 
-    /// Inicia la postulacion enviando Election a todos los nodos con id mayor al suyo.Si no hay ninguno, se convierte en coordinador.
+    /// Inicia la postulación enviando `Election` a todos los nodos con id mayor
+    /// al suyo. Si no hay ninguno, se convierte en coordinador.
     fn iniciar_eleccion(&mut self) {
         let mut hay_mayores = false;
         for (id, tx) in &self.otros_nodos {
@@ -172,7 +179,11 @@ impl Nodo {
         }
     }
 
-    /// Se fija si vencieron los tiempos de espera, para reinciiar la eleccion o para llamarse lider.
+    /// Revisa si vencieron los tiempos de espera:
+    /// - `espera_ok`: ningún nodo mayor respondió OK, así que este nodo gana.
+    /// - `espera_coord`: un nodo mayor respondió OK pero nunca anunció
+    ///   COORDINATOR (por ejemplo, porque se cayó), así que se reinicia la
+    ///   elección.
     fn revisar_timeouts(&mut self) {
         let ahora = Instant::now();
         if self.espera_ok.is_some_and(|t| ahora >= t) {
@@ -219,14 +230,23 @@ impl Monitor {
         }
     }
 
-    /// Loop del monitor, escucha cada 100ms, si lo que escucha es un Heartbeat actualiza el estado de los nodos y el instante en el que escucho.
-    /// Si durante 100ms no escucha nada, sigue.
-    /// Si el error es un Disconnected significa que no hay nodos activos, por lo tanto corta el loop.
-    /// Por ultimo, si recibio un Heartbeat o se cumplieron los 100ms se invoca a la funcion verificar_timeouts().
+    /// Loop del monitor. Escucha el canal con `recv_timeout` de 100 ms:
+    /// - Si llega un `Heartbeat`, actualiza el instante del último latido de
+    ///   ese nodo y, si estaba SOSPECHOSO, lo vuelve a ACTIVO.
+    /// - Si pasan 100 ms sin mensajes, sigue (es el "tic" del reloj).
+    /// - Si el canal se desconecta, no quedan nodos vivos y termina.
+    ///
+    /// En cada vuelta llama a `verificar_timeouts()`.
+    ///
+    /// ¿Por qué 100 ms y no `recv_timeout(1s)`? Los 3 nodos mandan sus latidos
+    /// por el mismo canal: con un timeout de 1 s, el latido de cualquier nodo
+    /// lo reiniciaría aunque otro nodo esté caído. Por eso el timeout funciona
+    /// como reloj y el tiempo sin latidos se mide por separado para cada nodo.
     pub fn monitorear(&mut self) {
         loop {
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(MensajeMonitor::Heartbeat(id)) => {
+                    println!("Monitor: latido del nodo {id}");
                     if let Some((instante, estado)) = self.nodos.get_mut(&id) {
                         *instante = Instant::now();
                         if *estado != EstadoNodo::Activo {
@@ -254,12 +274,13 @@ impl Monitor {
         }
     }
 
-    /// Recorre el hash de nodos. Si encuentra un nodo del que no haya recibido un Heartbeat hace mas de 2 segundos lo marca como caido
-    /// Si encuentra uno del que no haya recibido un hb hace mas de 1 seg pero menos de 2 seg, lo marca como sospechoso.
+    /// Recorre los nodos y actualiza su estado según el tiempo desde su último
+    /// latido: 2 s o más → CAIDO; entre 1 s y 2 s → SOSPECHOSO.
     ///
-    /// Si el nodo caido era el lider, manda la eleccion del nuevo lider entre los vivos y devuelve false.
-    /// Si cayo un nodo que no era lider, devuelve true para terminar el monitoreo
-
+    /// Si el nodo caído era el líder, dispara la elección entre los vivos y
+    /// devuelve `false` (el monitoreo sigue hasta que haya nuevo líder).
+    /// Si cayó un nodo que no era líder, devuelve `true` para terminar el
+    /// monitoreo (la demo termina ahí, porque el líder sigue activo).
     pub fn verificar_timeouts(&mut self) -> bool {
         let mut lider_caido = false;
         let mut otro_caido = false;
@@ -276,11 +297,11 @@ impl Monitor {
                         otro_caido = true;
                     }
                 }
-            } else if tiempo_transcurrido >= Duration::from_secs(1) {
-                if *estado != EstadoNodo::Sospechoso {
-                    *estado = EstadoNodo::Sospechoso;
-                    println!("El nodo {nodo} paso a estado {estado}");
-                }
+            } else if tiempo_transcurrido >= Duration::from_secs(1)
+                && *estado != EstadoNodo::Sospechoso
+            {
+                *estado = EstadoNodo::Sospechoso;
+                println!("El nodo {nodo} paso a estado {estado}");
             }
         }
         if lider_caido {
@@ -291,13 +312,13 @@ impl Monitor {
         otro_caido && self.nodos[&self.lider].1 != EstadoNodo::Caido
     }
 
-    // Envia IniciarEleccion a todos los nodos que no estan en estado caido.
+    /// Envía `IniciarEleccion` a todos los nodos que no están CAIDOS.
     fn empezar_eleccion(&self) {
         for (id, (_, estado)) in &self.nodos {
-            if *estado != EstadoNodo::Caido {
-                if let Some(tx) = self.tx_nodos.get(id) {
-                    let _ = tx.send(MensajeNodo::IniciarEleccion);
-                }
+            if *estado != EstadoNodo::Caido
+                && let Some(tx) = self.tx_nodos.get(id)
+            {
+                let _ = tx.send(MensajeNodo::IniciarEleccion);
             }
         }
     }
@@ -316,13 +337,13 @@ mod tests {
     fn monitor_de_prueba() -> (Monitor, HashMap<u64, Receiver<MensajeNodo>>) {
         let (_tx, rx) = mpsc::channel::<MensajeMonitor>();
         let mut senders = HashMap::new();
-        let mut recievers = HashMap::new();
+        let mut receivers = HashMap::new();
         for id in [1, 2, 3] {
             let (s, r) = mpsc::channel();
             senders.insert(id, s);
-            recievers.insert(id, r);
+            receivers.insert(id, r);
         }
-        (Monitor::new(vec![1, 2, 3], rx, 3, senders), recievers)
+        (Monitor::new(vec![1, 2, 3], rx, 3, senders), receivers)
     }
 
     fn nodo_prueba(
@@ -336,15 +357,15 @@ mod tests {
         let (tx_monitor, rx_monitor) = mpsc::channel();
         let (_tx_nodo, rx_nodo) = mpsc::channel();
         let mut senders = HashMap::new();
-        let mut recivers = HashMap::new();
+        let mut receivers = HashMap::new();
 
         for &otro_nodo in otros {
             let (s, r) = mpsc::channel();
             senders.insert(otro_nodo, s);
-            recivers.insert(otro_nodo, r);
+            receivers.insert(otro_nodo, r);
         }
         let nodo = Nodo::new(id, tx_monitor, rx_nodo, senders, 3);
-        (nodo, recivers, rx_monitor)
+        (nodo, receivers, rx_monitor)
     }
 
     #[test]

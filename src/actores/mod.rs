@@ -8,7 +8,6 @@
 //! al hilo al iniciarlo y los demás solo tienen un `Handle` que envuelve el
 //! `Sender` de su buzón. Por eso no hacen falta locks sobre el estado.
 
-
 pub mod cuenta_usuario;
 pub mod inventario_entradas;
 
